@@ -1,11 +1,11 @@
-// Package snake implements a small, dependency-free Snake game for ANSI
+// Package snek implements a small, dependency-free Snake game for ANSI
 // terminals.
 //
 // The package keeps the game deliberately simple. The snake body is stored in a
 // ring buffer, and occupied cells are tracked with one bit per board cell. A
 // frame is streamed directly to the terminal writer; no per-frame maps, screen
 // buffers, or body copies are allocated.
-package snake
+package snek
 
 import (
 	"bufio"
@@ -22,7 +22,7 @@ const (
 	hudRows        uint16 = 1
 	minBoardWidth  uint16 = 12
 	minBoardHeight uint16 = 6
-	foodCount      int    = 10
+	foodCount      int    = 1
 )
 
 const (
@@ -50,29 +50,47 @@ const (
 	hudRestart   = "   r restart"
 	hudScoreText = "   score "
 	hudGameOver  = "  game over"
+	hudBotOff    = "   b bot"
+	hudBotOn     = "   bot on"
 
-	overlayStart   = "SNAKE"
+	overlayStart   = "SNEK"
 	overlayOver    = "GAME OVER"
-	overlayMove    = "wasd or arrows to start"
+	overlayMove    = "wasd/arrows or b bot"
 	overlaySpeedQ  = "   1-5 speed   q quit"
 	overlayRestart = "r restart   1-5 speed   q quit"
 )
 
-// Run starts Snake on the process standard input and output.
-func Run() error {
-	return RunTerminal(os.Stdin, os.Stdout)
+// Options configures a terminal game session.
+type Options struct {
+	Bot bool
 }
 
-// RunTerminal starts Snake using in for keyboard input and out for rendering.
+// Run starts Snek on the process standard input and output.
+func Run() error {
+	return RunWithOptions(Options{})
+}
+
+// RunWithOptions starts Snek on the process standard input and output.
+func RunWithOptions(opts Options) error {
+	return RunTerminalWithOptions(os.Stdin, os.Stdout, opts)
+}
+
+// RunTerminal starts Snek using in for keyboard input and out for rendering.
 // Both files must refer to an interactive terminal.
 func RunTerminal(in, out *os.File) error {
+	return RunTerminalWithOptions(in, out, Options{})
+}
+
+// RunTerminalWithOptions starts Snek using in for keyboard input and out for
+// rendering. Both files must refer to an interactive terminal.
+func RunTerminalWithOptions(in, out *os.File, opts Options) error {
 	if in == nil || out == nil {
-		return fmt.Errorf("snake: nil terminal file")
+		return fmt.Errorf("snek: nil terminal file")
 	}
 
 	oldState, err := enableRawMode(int(in.Fd()))
 	if err != nil {
-		return fmt.Errorf("snake: raw terminal mode: %w", err)
+		return fmt.Errorf("snek: raw terminal mode: %w", err)
 	}
 	defer restoreTerminal(int(in.Fd()), oldState)
 
@@ -91,12 +109,13 @@ func RunTerminal(in, out *os.File) error {
 	var game game
 	game.reset(spec.width, spec.height, uint64(time.Now().UnixNano()))
 
-	started := false
+	botEnabled := opts.Bot
+	started := botEnabled
 	modeIndex := defaultMode
 	ticker := time.NewTicker(modes[modeIndex].tick)
 	defer ticker.Stop()
 
-	draw(writer, &game, spec, modes[modeIndex], started)
+	draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
 
 	for {
 		select {
@@ -110,7 +129,18 @@ func RunTerminal(in, out *os.File) error {
 					modeIndex = next
 					ticker.Reset(modes[modeIndex].tick)
 				}
-				draw(writer, &game, spec, modes[modeIndex], started)
+				draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
+			case toggleBot:
+				botEnabled = !botEnabled
+				if !game.over {
+					started = started || botEnabled
+					if botEnabled {
+						if move, ok := botAction(&game); ok {
+							game.turn(move)
+						}
+					}
+				}
+				draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
 			case restart:
 				if game.over {
 					spec, err = currentBoardSpec(int(out.Fd()))
@@ -118,14 +148,15 @@ func RunTerminal(in, out *os.File) error {
 						return err
 					}
 					game.reset(spec.width, spec.height, uint64(time.Now().UnixNano()))
-					started = false
-					draw(writer, &game, spec, modes[modeIndex], started)
+					started = botEnabled
+					draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
 				}
 			default:
 				if !game.over {
+					botEnabled = false
 					game.turn(input)
 					started = true
-					draw(writer, &game, spec, modes[modeIndex], started)
+					draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
 				}
 			}
 		case <-ticker.C:
@@ -136,14 +167,20 @@ func RunTerminal(in, out *os.File) error {
 			if nextSpec != spec {
 				spec = nextSpec
 				game.reset(spec.width, spec.height, uint64(time.Now().UnixNano()))
-				started = false
-				draw(writer, &game, spec, modes[modeIndex], started)
+				started = botEnabled
+				draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
 				continue
 			}
 
+			if botEnabled && !game.over {
+				if move, ok := botAction(&game); ok {
+					game.turn(move)
+					started = true
+				}
+			}
 			if started && !game.over {
 				game.step()
-				draw(writer, &game, spec, modes[modeIndex], started)
+				draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
 			}
 		}
 	}
@@ -175,6 +212,7 @@ const (
 	moveRight
 	restart
 	quit
+	toggleBot
 	easy
 	normal
 	hard
@@ -218,6 +256,20 @@ type game struct {
 	score int
 	over  bool
 	rand  random
+
+	botSeen      []uint32
+	botFood      []uint32
+	botQueue     []int
+	botBodySeen  []uint32
+	botBodyOrder []int
+	botLoopHash  []uint64
+	botLoopMask  []uint8
+	botStamp     uint32
+	botFoodStamp uint32
+	botBodyStamp uint32
+	botLoopScore int
+	botLoopLen   int
+	botLoopNext  int
 }
 
 func newGame(width, height uint16, seed uint64) *game {
@@ -240,6 +292,28 @@ func (g *game) reset(width, height uint16, seed uint64) {
 	} else {
 		clear(g.occupied)
 	}
+	if len(g.botSeen) != cells {
+		g.botSeen = make([]uint32, cells)
+	}
+	if len(g.botFood) != cells {
+		g.botFood = make([]uint32, cells)
+	}
+	if len(g.botQueue) != cells {
+		g.botQueue = make([]int, cells)
+	}
+	if len(g.botBodySeen) != cells {
+		g.botBodySeen = make([]uint32, cells)
+	}
+	if len(g.botBodyOrder) != cells {
+		g.botBodyOrder = make([]int, cells)
+	}
+	loopCells := cells * 2
+	if len(g.botLoopHash) != loopCells {
+		g.botLoopHash = make([]uint64, loopCells)
+	}
+	if len(g.botLoopMask) != loopCells {
+		g.botLoopMask = make([]uint8, loopCells)
+	}
 
 	g.width = width
 	g.height = height
@@ -251,6 +325,9 @@ func (g *game) reset(width, height uint16, seed uint64) {
 	g.score = 0
 	g.over = false
 	g.rand = newRandom(seed)
+	g.botLoopScore = 0
+	g.botLoopLen = 0
+	g.botLoopNext = 0
 
 	centerY := height / 2
 	startX := width / 2
@@ -409,6 +486,10 @@ func (g *game) ring(offset int) int {
 
 func (g *game) has(p point) bool {
 	i := g.index(p)
+	return g.hasIndex(i)
+}
+
+func (g *game) hasIndex(i int) bool {
 	return g.occupied[i>>6]&(uint64(1)<<uint(i&63)) != 0
 }
 
@@ -480,7 +561,7 @@ func currentBoardSpec(fd int) (board, error) {
 
 	width, height, ok := boardSize(cols, rows)
 	if !ok {
-		return board{}, fmt.Errorf("snake: terminal too small: need at least %dx%d, got %dx%d",
+		return board{}, fmt.Errorf("snek: terminal too small: need at least %dx%d, got %dx%d",
 			minBoardWidth*tileWidth, minBoardHeight+hudRows, cols, rows)
 	}
 	return board{width: width, height: height, cols: cols, rows: rows}, nil
@@ -492,7 +573,7 @@ func boardSize(cols, rows uint16) (uint16, uint16, bool) {
 	return width, height, width >= minBoardWidth && height >= minBoardHeight
 }
 
-func draw(out *bufio.Writer, g *game, b board, m mode, started bool) {
+func draw(out *bufio.Writer, g *game, b board, m mode, started, botEnabled bool) {
 	_, _ = out.WriteString(cursorHome)
 
 	for y := uint16(0); y < g.height; y++ {
@@ -519,7 +600,7 @@ func draw(out *bufio.Writer, g *game, b board, m mode, started bool) {
 		_, _ = out.WriteString(ansiReset)
 	}
 
-	writeHUD(out, g, b.cols, b.rows, m)
+	writeHUD(out, g, b.cols, b.rows, m, botEnabled)
 	if !started {
 		drawStartOverlay(out, b, m)
 	} else if g.over {
@@ -528,7 +609,7 @@ func draw(out *bufio.Writer, g *game, b board, m mode, started bool) {
 	_ = out.Flush()
 }
 
-func writeHUD(out *bufio.Writer, g *game, width, row uint16, m mode) {
+func writeHUD(out *bufio.Writer, g *game, width, row uint16, m mode, botEnabled bool) {
 	remaining := int(width)
 	if remaining <= 0 {
 		return
@@ -561,6 +642,11 @@ func writeHUD(out *bufio.Writer, g *game, width, row uint16, m mode) {
 	}
 	writeBounded(out, hudSpeedText, &remaining)
 	writeBounded(out, "   wasd/arrows", &remaining)
+	if botEnabled {
+		writeBounded(out, hudBotOn, &remaining)
+	} else {
+		writeBounded(out, hudBotOff, &remaining)
+	}
 	writeBounded(out, hudQuitText, &remaining)
 	writeSpaces(out, remaining)
 	_, _ = out.WriteString(ansiReset)
@@ -728,6 +814,8 @@ func readInput(r *bufio.Reader, actions chan<- action) {
 			send(actions, restart)
 		case 'q', 'Q', 3:
 			send(actions, quit)
+		case 'b', 'B':
+			send(actions, toggleBot)
 		case '1':
 			send(actions, easy)
 		case '2':
@@ -822,7 +910,7 @@ func terminalSize(fd int) (uint16, uint16, error) {
 		return 0, 0, err
 	}
 	if size.cols == 0 || size.rows == 0 {
-		return 0, 0, fmt.Errorf("snake: terminal size unavailable")
+		return 0, 0, fmt.Errorf("snek: terminal size unavailable")
 	}
 	return size.cols, size.rows, nil
 }
