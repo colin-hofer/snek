@@ -969,7 +969,7 @@ func exitGameScreen(out *bufio.Writer) {
 
 func enableRawMode(fd int) (*syscall.Termios, error) {
 	old := &syscall.Termios{}
-	if err := ioctlTermios(fd, syscall.TCGETS, old); err != nil {
+	if err := ioctlTermios(fd, termiosGetRequest, old); err != nil {
 		return nil, err
 	}
 
@@ -981,7 +981,7 @@ func enableRawMode(fd int) (*syscall.Termios, error) {
 	raw.Cc[syscall.VMIN] = 1
 	raw.Cc[syscall.VTIME] = 0
 
-	if err := ioctlTermios(fd, syscall.TCSETS, &raw); err != nil {
+	if err := ioctlTermios(fd, termiosSetRequest, &raw); err != nil {
 		return nil, err
 	}
 	return old, nil
@@ -989,7 +989,7 @@ func enableRawMode(fd int) (*syscall.Termios, error) {
 
 func restoreTerminal(fd int, state *syscall.Termios) {
 	if state != nil {
-		_ = ioctlTermios(fd, syscall.TCSETS, state)
+		_ = ioctlTermios(fd, termiosSetRequest, state)
 	}
 }
 
