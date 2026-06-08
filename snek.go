@@ -1,10 +1,10 @@
 // Package snek implements a small, dependency-free Snake game for ANSI
 // terminals.
 //
-// The package keeps the game deliberately simple. The snake body is stored in a
-// ring buffer, and occupied cells are tracked with one bit per board cell. A
-// frame is streamed directly to the terminal writer; no per-frame maps, screen
-// buffers, or body copies are allocated.
+// The package keeps the game deliberately simple. The snake body is stored as a
+// compact ring of cell indexes, and occupied cells are tracked with one bit per
+// board cell. A frame is streamed directly to the terminal writer; no per-frame
+// maps, screen buffers, or body copies are allocated.
 package snek
 
 import (
@@ -22,7 +22,9 @@ const (
 	hudRows        uint16 = 1
 	minBoardWidth  uint16 = 12
 	minBoardHeight uint16 = 6
-	foodCount      int    = 1
+	foodCount      int    = 1000
+	maxBoardCells  int    = 1<<16 - 1
+	maxBotLoopSeen int    = 2048
 )
 
 const (
@@ -138,6 +140,8 @@ func RunTerminalWithOptions(in, out *os.File, opts Options) error {
 						if move, ok := botAction(&game); ok {
 							game.turn(move)
 						}
+					} else {
+						game.releaseBotState()
 					}
 				}
 				draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
@@ -154,6 +158,7 @@ func RunTerminalWithOptions(in, out *os.File, opts Options) error {
 			default:
 				if !game.over {
 					botEnabled = false
+					game.releaseBotState()
 					game.turn(input)
 					started = true
 					draw(writer, &game, spec, modes[modeIndex], started, botEnabled)
@@ -190,6 +195,8 @@ type point struct {
 	x uint16
 	y uint16
 }
+
+type cellIndex uint16
 
 type direction struct {
 	x int8
@@ -230,43 +237,41 @@ var modes = [...]mode{
 	{name: "normal", tick: 110 * time.Millisecond},
 	{name: "hard", tick: 75 * time.Millisecond},
 	{name: "expert", tick: 50 * time.Millisecond},
-	{name: "bananas", tick: 30 * time.Millisecond},
+	{name: "bananas", tick: 10 * time.Millisecond},
 }
 
 const defaultMode = 1
 
 // game owns all mutable game state. The snake slice is a ring whose head is at
-// snake[head]. occupied mirrors that ring as a bitset for constant-time
-// collision checks. Food uses a fixed array because there are always at most
-// five pieces.
+// snake[head]. occupied and foodBits are bitsets for constant-time membership
+// checks.
 type game struct {
 	width  uint16
 	height uint16
 
-	snake    []point
+	snake    []cellIndex
 	occupied []uint64
 	head     int
 	length   int
 
-	dir   direction
-	next  direction
-	food  [foodCount]point
-	foods int
+	dir      direction
+	next     direction
+	food     [foodCount]cellIndex
+	foodBits []uint64
+	foods    int
 
 	score int
 	over  bool
 	rand  random
 
-	botSeen      []uint32
-	botFood      []uint32
-	botQueue     []int
-	botBodySeen  []uint32
-	botBodyOrder []int
+	botSeen      []uint16
+	botQueue     []cellIndex
+	botBodySeen  []uint16
+	botBodyOrder []cellIndex
 	botLoopHash  []uint64
 	botLoopMask  []uint8
-	botStamp     uint32
-	botFoodStamp uint32
-	botBodyStamp uint32
+	botStamp     uint16
+	botBodyStamp uint16
 	botLoopScore int
 	botLoopLen   int
 	botLoopNext  int
@@ -284,7 +289,7 @@ func (g *game) reset(width, height uint16, seed uint64) {
 		cells = 1
 	}
 	if len(g.snake) != cells {
-		g.snake = make([]point, cells)
+		g.snake = make([]cellIndex, cells)
 	}
 	words := (cells + 63) / 64
 	if len(g.occupied) != words {
@@ -292,29 +297,11 @@ func (g *game) reset(width, height uint16, seed uint64) {
 	} else {
 		clear(g.occupied)
 	}
-	if len(g.botSeen) != cells {
-		g.botSeen = make([]uint32, cells)
+	if len(g.foodBits) != words {
+		g.foodBits = make([]uint64, words)
+	} else {
+		clear(g.foodBits)
 	}
-	if len(g.botFood) != cells {
-		g.botFood = make([]uint32, cells)
-	}
-	if len(g.botQueue) != cells {
-		g.botQueue = make([]int, cells)
-	}
-	if len(g.botBodySeen) != cells {
-		g.botBodySeen = make([]uint32, cells)
-	}
-	if len(g.botBodyOrder) != cells {
-		g.botBodyOrder = make([]int, cells)
-	}
-	loopCells := cells * 2
-	if len(g.botLoopHash) != loopCells {
-		g.botLoopHash = make([]uint64, loopCells)
-	}
-	if len(g.botLoopMask) != loopCells {
-		g.botLoopMask = make([]uint8, loopCells)
-	}
-
 	g.width = width
 	g.height = height
 	g.head = 0
@@ -325,9 +312,7 @@ func (g *game) reset(width, height uint16, seed uint64) {
 	g.score = 0
 	g.over = false
 	g.rand = newRandom(seed)
-	g.botLoopScore = 0
-	g.botLoopLen = 0
-	g.botLoopNext = 0
+	g.releaseBotState()
 
 	centerY := height / 2
 	startX := width / 2
@@ -336,7 +321,7 @@ func (g *game) reset(width, height uint16, seed uint64) {
 	}
 	for i := 0; i < g.length; i++ {
 		p := point{x: startX - uint16(i), y: centerY}
-		g.snake[i] = p
+		g.snake[i] = cellIndex(g.index(p))
 		g.set(p)
 	}
 	for i := 0; i < foodCount; i++ {
@@ -344,6 +329,43 @@ func (g *game) reset(width, height uint16, seed uint64) {
 			break
 		}
 	}
+}
+
+func (g *game) ensureBotState() {
+	cells := int(g.width) * int(g.height)
+	if len(g.botSeen) != cells {
+		g.botSeen = make([]uint16, cells)
+	}
+	if len(g.botQueue) != cells {
+		g.botQueue = make([]cellIndex, cells)
+	}
+	if len(g.botBodySeen) != cells {
+		g.botBodySeen = make([]uint16, cells)
+	}
+	if len(g.botBodyOrder) != cells {
+		g.botBodyOrder = make([]cellIndex, cells)
+	}
+	loopCells := min(cells, maxBotLoopSeen)
+	if len(g.botLoopHash) != loopCells {
+		g.botLoopHash = make([]uint64, loopCells)
+	}
+	if len(g.botLoopMask) != loopCells {
+		g.botLoopMask = make([]uint8, loopCells)
+	}
+}
+
+func (g *game) releaseBotState() {
+	g.botSeen = nil
+	g.botQueue = nil
+	g.botBodySeen = nil
+	g.botBodyOrder = nil
+	g.botLoopHash = nil
+	g.botLoopMask = nil
+	g.botStamp = 0
+	g.botBodyStamp = 0
+	g.botLoopScore = 0
+	g.botLoopLen = 0
+	g.botLoopNext = 0
 }
 
 func initialLength(width uint16) int {
@@ -390,9 +412,10 @@ func (g *game) step() {
 	}
 
 	next := point{x: uint16(nextX), y: uint16(nextY)}
-	eaten, grow := g.foodAt(next)
-	tail := g.tailPoint()
-	if g.has(next) && (grow || next != tail) {
+	nextIndex := g.index(next)
+	eaten, grow := g.foodAtIndex(nextIndex)
+	tail := g.tailIndex()
+	if g.hasIndex(nextIndex) && (grow || nextIndex != tail) {
 		g.over = true
 		return
 	}
@@ -401,8 +424,8 @@ func (g *game) step() {
 	if g.head < 0 {
 		g.head = len(g.snake) - 1
 	}
-	g.snake[g.head] = next
-	g.set(next)
+	g.snake[g.head] = cellIndex(nextIndex)
+	g.setIndex(nextIndex)
 
 	if grow {
 		g.score++
@@ -412,8 +435,8 @@ func (g *game) step() {
 		}
 		return
 	}
-	if next != tail {
-		g.clear(tail)
+	if nextIndex != tail {
+		g.clearIndex(tail)
 	}
 }
 
@@ -430,13 +453,15 @@ func (g *game) spawnFood(slot int) bool {
 		return false
 	}
 
+	cells := int(g.width) * int(g.height)
 	for {
-		p := point{
-			x: uint16(g.rand.next(uint32(g.width))),
-			y: uint16(g.rand.next(uint32(g.height))),
-		}
-		if !g.has(p) && !g.foodOccupies(p, slot) {
-			g.food[slot] = p
+		index := int(g.rand.next(uint32(cells)))
+		if !g.hasIndex(index) && !g.foodOccupiesIndex(index, slot) {
+			if slot < g.foods {
+				g.clearFoodIndex(int(g.food[slot]))
+			}
+			g.food[slot] = cellIndex(index)
+			g.setFoodIndex(index)
 			if slot == g.foods {
 				g.foods++
 			}
@@ -446,8 +471,15 @@ func (g *game) spawnFood(slot int) bool {
 }
 
 func (g *game) foodAt(p point) (int, bool) {
+	return g.foodAtIndex(g.index(p))
+}
+
+func (g *game) foodAtIndex(index int) (int, bool) {
+	if !g.hasFoodIndex(index) {
+		return 0, false
+	}
 	for i := 0; i < g.foods; i++ {
-		if g.food[i] == p {
+		if int(g.food[i]) == index {
 			return i, true
 		}
 	}
@@ -455,25 +487,34 @@ func (g *game) foodAt(p point) (int, bool) {
 }
 
 func (g *game) isFood(p point) bool {
-	_, ok := g.foodAt(p)
-	return ok
+	return g.hasFoodIndex(g.index(p))
 }
 
 func (g *game) foodOccupies(p point, skip int) bool {
-	for i := 0; i < g.foods; i++ {
-		if i != skip && g.food[i] == p {
-			return true
-		}
+	return g.foodOccupiesIndex(g.index(p), skip)
+}
+
+func (g *game) foodOccupiesIndex(index int, skip int) bool {
+	if !g.hasFoodIndex(index) {
+		return false
 	}
-	return false
+	return skip < 0 || skip >= g.foods || int(g.food[skip]) != index
 }
 
 func (g *game) headPoint() point {
-	return g.snake[g.head]
+	return g.pointAt(g.headIndex())
 }
 
 func (g *game) tailPoint() point {
-	return g.snake[g.ring(g.length-1)]
+	return g.pointAt(g.tailIndex())
+}
+
+func (g *game) headIndex() int {
+	return int(g.snake[g.head])
+}
+
+func (g *game) tailIndex() int {
+	return int(g.snake[g.ring(g.length-1)])
 }
 
 func (g *game) ring(offset int) int {
@@ -493,18 +534,53 @@ func (g *game) hasIndex(i int) bool {
 	return g.occupied[i>>6]&(uint64(1)<<uint(i&63)) != 0
 }
 
+func (g *game) hasFoodIndex(i int) bool {
+	return g.foodBits[i>>6]&(uint64(1)<<uint(i&63)) != 0
+}
+
 func (g *game) set(p point) {
 	i := g.index(p)
-	g.occupied[i>>6] |= uint64(1) << uint(i&63)
+	g.setIndex(i)
 }
 
 func (g *game) clear(p point) {
 	i := g.index(p)
+	g.clearIndex(i)
+}
+
+func (g *game) setIndex(i int) {
+	g.occupied[i>>6] |= uint64(1) << uint(i&63)
+}
+
+func (g *game) clearIndex(i int) {
 	g.occupied[i>>6] &^= uint64(1) << uint(i&63)
+}
+
+func (g *game) setFood(p point) {
+	i := g.index(p)
+	g.setFoodIndex(i)
+}
+
+func (g *game) clearFood(p point) {
+	i := g.index(p)
+	g.clearFoodIndex(i)
+}
+
+func (g *game) setFoodIndex(i int) {
+	g.foodBits[i>>6] |= uint64(1) << uint(i&63)
+}
+
+func (g *game) clearFoodIndex(i int) {
+	g.foodBits[i>>6] &^= uint64(1) << uint(i&63)
 }
 
 func (g *game) index(p point) int {
 	return int(p.y)*int(g.width) + int(p.x)
+}
+
+func (g *game) pointAt(index int) point {
+	width := int(g.width)
+	return point{x: uint16(index % width), y: uint16(index / width)}
 }
 
 func opposite(a, b direction) bool {
@@ -568,30 +644,50 @@ func currentBoardSpec(fd int) (board, error) {
 }
 
 func boardSize(cols, rows uint16) (uint16, uint16, bool) {
+	if rows <= hudRows {
+		return 0, 0, false
+	}
+
 	width := cols / tileWidth
 	height := rows - hudRows
+	if width > minBoardWidth && width%2 != 0 {
+		width--
+	}
+	if int(width)*int(height) > maxBoardCells {
+		if maxHeight := uint16(maxBoardCells / int(width)); maxHeight >= minBoardHeight {
+			height = maxHeight
+		} else {
+			height = minBoardHeight
+			width = uint16(maxBoardCells / int(height))
+			if width > minBoardWidth && width%2 != 0 {
+				width--
+			}
+		}
+	}
 	return width, height, width >= minBoardWidth && height >= minBoardHeight
 }
 
 func draw(out *bufio.Writer, g *game, b board, m mode, started, botEnabled bool) {
 	_, _ = out.WriteString(cursorHome)
 
+	head := g.headPoint()
+	index := 0
 	for y := uint16(0); y < g.height; y++ {
 		writeAt(out, y+1, 1)
 		for x := uint16(0); x < g.width; x++ {
-			p := point{x: x, y: y}
 			switch {
-			case g.has(p):
-				if p == g.headPoint() {
+			case g.hasIndex(index):
+				if x == head.x && y == head.y {
 					_, _ = out.WriteString(headTile)
 				} else {
 					_, _ = out.WriteString(bodyTile)
 				}
-			case g.isFood(p):
+			case g.hasFoodIndex(index):
 				_, _ = out.WriteString(foodTile)
 			default:
 				_, _ = out.WriteString(emptyTile)
 			}
+			index++
 		}
 		if rest := b.cols - g.width*tileWidth; rest > 0 {
 			_, _ = out.WriteString(bgBlack)
