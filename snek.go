@@ -22,7 +22,7 @@ const (
 	hudRows        uint16 = 1
 	minBoardWidth  uint16 = 12
 	minBoardHeight uint16 = 6
-	foodCount      int    = 1000
+	foodCount      int    = 5
 	maxBoardCells  int    = 1<<16 - 1
 	maxBotLoopSeen int    = 2048
 )
